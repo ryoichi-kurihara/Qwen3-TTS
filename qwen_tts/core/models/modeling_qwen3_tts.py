@@ -27,7 +27,7 @@ from torch import nn
 from torch.nn import functional as F
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
-from transformers.generation import GenerationMixin
+from transformers.generation import GenerationMixin, StoppingCriteria, StoppingCriteriaList
 from transformers.integrations import use_kernel_forward_from_hub
 from transformers.masking_utils import (create_causal_mask,
                                         create_sliding_window_causal_mask)
@@ -1810,6 +1810,25 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         return model_kwargs
 
 
+class _DeferredStoppingCriteria(StoppingCriteria):
+    """Delegate to the caller's stopping criteria only once `min_new_tokens` tokens exist.
+
+    The talker records the codec ids of token k in the forward pass of step k+1, so
+    stopping right after the first sampled token would leave `generate()` with no codec
+    rows to stack. Deferring the caller's criteria until `min_new_tokens` (>= 2) tokens
+    guarantees at least one codec row.
+    """
+
+    def __init__(self, criteria: StoppingCriteriaList, min_new_tokens: int):
+        self.criteria = criteria
+        self.min_new_tokens = min_new_tokens
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> torch.BoolTensor:
+        if input_ids.shape[1] < self.min_new_tokens:
+            return torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+        return self.criteria(input_ids, scores, **kwargs)
+
+
 class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin):
     config_class = Qwen3TTSConfig
 
@@ -2039,6 +2058,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         subtalker_temperature: float = 0.9,
         eos_token_id: Optional[int] = None,
         repetition_penalty: float = 1.05,
+        stopping_criteria: Optional[StoppingCriteriaList] = None,
         **kwargs,
     ):
         talker_kwargs = {
@@ -2064,6 +2084,14 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             "output_hidden_states": getattr(kwargs, "output_hidden_states", True),
             "return_dict_in_generate": getattr(kwargs, "return_dict_in_generate", True)
         }
+        # Forward caller-supplied stopping criteria to the talker so token generation
+        # can be stopped cooperatively (e.g. cancellation). Only added when given so the
+        # talker call stays unchanged otherwise. Deferred until `min_new_tokens` so that
+        # at least one codec row exists when generation stops (see _DeferredStoppingCriteria).
+        if stopping_criteria is not None:
+            talker_kwargs["stopping_criteria"] = StoppingCriteriaList([
+                _DeferredStoppingCriteria(stopping_criteria, talker_kwargs["min_new_tokens"])
+            ])
         
         talker_input_embeds = [[] for _ in range(len(input_ids))]
 
