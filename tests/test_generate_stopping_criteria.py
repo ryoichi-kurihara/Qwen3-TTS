@@ -1,32 +1,28 @@
 """Unit tests for forwarding `stopping_criteria` from
 `Qwen3TTSForConditionalGeneration.generate()` to `self.talker.generate()`.
 
-A tiny randomly initialised model is built on CPU (no weights download). The
-forwarding tests replace the talker's `generate()` with a fake that records its
-kwargs; the deferral tests run the real Hugging Face generation loop.
+The forwarding tests replace the talker's `generate()` with a fake that records its
+kwargs; the deferral tests run the real Hugging Face generation loop on the tiny model.
 
 Run: python -m pytest -q tests
 """
-import types
-
 import pytest
 import torch
-from transformers.generation import StoppingCriteria, StoppingCriteriaList
+from transformers.generation import StoppingCriteriaList
 
-from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
-from qwen_tts.core.models.modeling_qwen3_tts import (
-    Qwen3TTSForConditionalGeneration,
-    _DeferredStoppingCriteria,
+from qwen_tts.core.models.modeling_qwen3_tts import _DeferredStoppingCriteria
+from tests.tiny_model import (
+    HIDDEN_SIZE,
+    NUM_CODE_GROUPS,
+    RecordingCriteria,
+    fake_talker_result,
+    tiny_model,
 )
 
 
-NUM_CODE_GROUPS = 4
-HIDDEN_SIZE = 16
-CODEC_EOS_TOKEN_ID = 2150
-
 # Keyword arguments `generate()` passed to `talker.generate()` before
-# `stopping_criteria` forwarding was added. Must stay unchanged when the
-# caller does not pass `stopping_criteria`.
+# `stopping_criteria` / `codec_streamer` forwarding was added. Must stay unchanged
+# when the caller does not pass them.
 BASELINE_TALKER_KWARGS = {
     "inputs_embeds",
     "attention_mask",
@@ -49,91 +45,17 @@ BASELINE_TALKER_KWARGS = {
     "return_dict_in_generate",
 }
 
-
-class _RecordingCriteria(StoppingCriteria):
-    """Return `stop` for every sequence and record the `input_ids` length of each call."""
-
-    def __init__(self, stop: bool) -> None:
-        self.stop = stop
-        self.lengths: list[int] = []
-
-    def __call__(self, input_ids, scores, **kwargs):
-        self.lengths.append(input_ids.shape[1])
-        return torch.full((input_ids.shape[0],), self.stop, dtype=torch.bool, device=input_ids.device)
-
-
-def _tiny_config() -> Qwen3TTSConfig:
-    return Qwen3TTSConfig(
-        tts_model_type="custom_voice",
-        tts_pad_token_id=101,
-        tts_bos_token_id=102,
-        tts_eos_token_id=103,
-        talker_config=dict(
-            vocab_size=3072,
-            text_vocab_size=200,
-            hidden_size=HIDDEN_SIZE,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            text_hidden_size=HIDDEN_SIZE,
-            num_code_groups=NUM_CODE_GROUPS,
-            # mrope sections must sum to half the head dim (16 / 2 heads / 2 = 4).
-            rope_scaling={"interleaved": True, "mrope_section": [2, 1, 1], "rope_type": "default", "type": "default"},
-            codec_eos_token_id=CODEC_EOS_TOKEN_ID,
-            codec_pad_id=2148,
-            codec_bos_id=2149,
-            codec_think_id=2154,
-            codec_nothink_id=2155,
-            codec_think_bos_id=2156,
-            codec_think_eos_id=2157,
-            codec_language_id={"japanese": 2058},
-            spk_id={},
-            spk_is_dialect={},
-            code_predictor_config=dict(
-                vocab_size=2048,
-                hidden_size=HIDDEN_SIZE,
-                intermediate_size=32,
-                num_hidden_layers=1,
-                num_attention_heads=2,
-                num_key_value_heads=1,
-                head_dim=8,
-                num_code_groups=NUM_CODE_GROUPS,
-            ),
-        ),
-    )
-
-
-def _fake_talker_result(num_steps: int):
-    """Mimic `talker.generate()` output: per-step `(layer_hidden_states, codec_ids)`.
-
-    Step 0 is the prefill step (no codec ids); the last step emits the codec EOS.
-    """
-    def hidden():
-        return (torch.zeros(1, 1, HIDDEN_SIZE),)
-
-    def codes(first):
-        return torch.tensor([[first] + [7] * (NUM_CODE_GROUPS - 1)])
-
-    steps = [(hidden(), None)]
-    steps += [(hidden(), codes(1)) for _ in range(num_steps - 1)]
-    steps.append((hidden(), codes(CODEC_EOS_TOKEN_ID)))
-    return types.SimpleNamespace(hidden_states=tuple(steps))
-
-
-def _tiny_model() -> Qwen3TTSForConditionalGeneration:
-    torch.manual_seed(0)
-    return Qwen3TTSForConditionalGeneration(_tiny_config()).eval()
+_GREEDY = dict(max_new_tokens=6, do_sample=False, subtalker_dosample=False)
 
 
 @pytest.fixture
 def model_and_calls():
-    model = _tiny_model()
+    model = tiny_model()
     calls = []
 
     def fake_talker_generate(**kwargs):
         calls.append(kwargs)
-        return _fake_talker_result(num_steps=3)
+        return fake_talker_result(num_steps=3)
 
     model.talker.generate = fake_talker_generate
     return model, calls
@@ -146,7 +68,7 @@ def _run_generate(model, **extra):
 
 def test_stopping_criteria_is_forwarded_to_talker_generate_deferred(model_and_calls):
     model, calls = model_and_calls
-    criteria = StoppingCriteriaList([_RecordingCriteria(stop=False)])
+    criteria = StoppingCriteriaList([RecordingCriteria(stop=False)])
 
     _run_generate(model, stopping_criteria=criteria)
 
@@ -176,12 +98,10 @@ def test_talker_kwargs_and_return_shape_unchanged_without_stopping_criteria(mode
 
 # --- real Hugging Face generation loop on the tiny model ---
 
-_GREEDY = dict(max_new_tokens=6, do_sample=False, subtalker_dosample=False)
-
 
 def test_stop_requested_from_first_token_still_returns_one_codec_row():
-    model = _tiny_model()
-    criteria = _RecordingCriteria(stop=True)
+    model = tiny_model()
+    criteria = RecordingCriteria(stop=True)
 
     codes_list, hidden_list = _run_generate(
         model, stopping_criteria=StoppingCriteriaList([criteria]), **_GREEDY
@@ -195,10 +115,10 @@ def test_stop_requested_from_first_token_still_returns_one_codec_row():
 
 
 def test_non_stopping_criteria_does_not_change_greedy_output():
-    codes_without, hidden_without = _run_generate(_tiny_model(), **_GREEDY)
-    criteria = _RecordingCriteria(stop=False)
+    codes_without, hidden_without = _run_generate(tiny_model(), **_GREEDY)
+    criteria = RecordingCriteria(stop=False)
     codes_with, hidden_with = _run_generate(
-        _tiny_model(), stopping_criteria=StoppingCriteriaList([criteria]), **_GREEDY
+        tiny_model(), stopping_criteria=StoppingCriteriaList([criteria]), **_GREEDY
     )
 
     assert criteria.lengths == [2, 3, 4, 5, 6]

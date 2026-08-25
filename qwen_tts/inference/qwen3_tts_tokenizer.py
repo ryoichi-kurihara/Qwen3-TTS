@@ -364,6 +364,27 @@ class Qwen3TTSTokenizer:
         wavs = [w.to(torch.float32).detach().cpu().numpy() for w in wav_tensors]
         return wavs, int(self.model.get_output_sample_rate())
 
+    @torch.inference_mode()
+    def decode_chunk(self, audio_codes: Union[torch.Tensor, np.ndarray], context_size: int) -> np.ndarray:
+        """
+        Decode one chunk of 12Hz codes for streaming playback.
+
+        Args:
+            audio_codes (torch.Tensor | np.ndarray):
+                Codes of shape `(context_size + new_frames, num_quantizers)` for a single sample.
+            context_size (int):
+                Number of leading frames used only as left context; their audio is not returned.
+
+        Returns:
+            np.ndarray: float32 waveform of the new frames only.
+        """
+        if self.model.get_model_type() != "qwen3_tts_tokenizer_12hz":
+            raise ValueError("decode_chunk is only supported by the 12Hz tokenizer.")
+        codes = audio_codes if isinstance(audio_codes, torch.Tensor) else torch.from_numpy(np.asarray(audio_codes))
+        codes = codes.to(self.device, dtype=torch.long).unsqueeze(0)
+        wav = self.model.decode_chunk(codes, context_size)[0]
+        return wav.to(torch.float32).detach().cpu().numpy()
+
     def get_model_type(self) -> str:
         """
         Get the underlying tokenizer model type.
