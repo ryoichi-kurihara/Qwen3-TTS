@@ -33,6 +33,7 @@ We release **Qwen3-TTS**, a series of powerful speech generation capabilities de
     - [Voice Clone](#voice-clone)
     - [Voice Design then Clone](#voice-design-then-clone)
     - [Tokenizer Encode and Decode](#tokenizer-encode-and-decode)
+    - [Streaming Generation and Cancellation (Fork Extension)](#streaming-generation-and-cancellation-fork-extension)
   - [Launch Local Web UI Demo](#launch-local-web-ui-demo)
   - [DashScope API Usage](#dashscope-api-usage)
 - [vLLM Usage](#vllm-usage)
@@ -373,6 +374,63 @@ sf.write("decode_output.wav", wavs[0], sr)
 ```
 
 For more tokenizer examples (including different input formats and batch usage), please refer to the [example codes](https://github.com/QwenLM/Qwen3-TTS/blob/main/examples/test_tokenizer_12hz.py). With those examples and the description for `Qwen3TTSTokenizer`, you can explore more advanced usage patterns.
+
+#### Streaming Generation and Cancellation (Fork Extension)
+
+This fork adds two capabilities to the Base (voice clone) model on top of the official package. Everything else is unchanged; when neither feature is used, the arguments handed to the talker and the generated audio are identical to upstream.
+
+**Cooperative cancellation.** Every `generate_*` method forwards a Hugging Face `stopping_criteria` to the talker, so codec token generation can be stopped from another thread. The criteria is evaluated once per codec frame (80 ms of audio) and returns the audio generated so far.
+
+```python
+import threading
+import torch
+from transformers.generation import StoppingCriteria, StoppingCriteriaList
+
+class EventStoppingCriteria(StoppingCriteria):
+    def __init__(self, event): self.event = event
+    def __call__(self, input_ids, scores, **kwargs):
+        return torch.full((input_ids.shape[0],), self.event.is_set(), dtype=torch.bool, device=input_ids.device)
+
+cancel = threading.Event()
+wavs, sr = model.generate_voice_clone(
+    text="...", language="Japanese", voice_clone_prompt=prompt,
+    stopping_criteria=StoppingCriteriaList([EventStoppingCriteria(cancel)]),
+)
+# call cancel.set() from another thread to stop; the partial audio is returned
+```
+
+The talker records the codec row of token *k* during the forward pass of step *k+1*, so the caller's criteria is consulted only from the second sampled frame on (`min_new_tokens=2`). A stop requested before that still returns one frame instead of failing.
+
+**Streaming generation.** `generate_voice_clone_stream` yields audio while the talker is still generating. Generation runs in a worker thread; the 12Hz tokenizer decoder is causal, so each group of frames is decoded as soon as it exists, using only past frames as context.
+
+```python
+stream = model.generate_voice_clone_stream(
+    text="...", language="Japanese", voice_clone_prompt=prompt,
+    chunk_frames=12, left_context_frames=100,
+)
+for wav_chunk, sr in stream:   # np.ndarray float32, sample rate
+    play(wav_chunk)
+# closing the iterator early (stream.close()) stops the talker and waits for it
+```
+
+Units: one codec frame is 1920 samples at 24 kHz = **80 ms** (12.5 frames/s). On an RTX 5090 the 1.7B model generates one frame in about 55 ms, i.e. faster than real time.
+
+| Parameter | Default | Meaning | Effect |
+|---|---|---|---|
+| `chunk_frames` | 12 | Frames per yielded chunk | Chunk length = `chunk_frames` x 80 ms (12 -> 0.96 s). First-chunk latency = prefill + `chunk_frames` x per-frame generation time (measured 0.7-0.8 s at 12). Smaller values lower the latency and only add one decoder call (~16 ms) per chunk. |
+| `left_context_frames` | 100 | Past frames given to the decoder together with each chunk; their audio is not returned. The reference codes of an ICL prompt seed the context of the first chunk. | Fidelity to the non-streaming decode only; the timing does not change. The decoder attends over a 72-frame sliding window per layer, so short contexts alter the waveform slightly. Measured SNR of the chunked waveform against the non-streaming decode (1.7B-Base, bf16): 25 frames 16 dB, 50 frames 21.5 dB, 72 frames 24.5 dB, 100 frames 26 dB, 150-300 frames 26 dB (plateau). The difference is spread evenly over the audio rather than concentrated at chunk boundaries. Decoding a chunk with 100 frames of context takes about 16 ms. |
+| `stopping_criteria` | none | Same as above | Merged with the internal stop used by `close()`. |
+| other `**kwargs` | | Same generation arguments as `generate_voice_clone` | |
+
+Restrictions: a single text per call, Base model with the 12Hz tokenizer only.
+
+Lower-level building blocks, if you need a different pipeline:
+
+- `Qwen3TTSForConditionalGeneration.generate(..., codec_streamer=...)` pushes every finished codec row `(batch, num_code_groups)` to a `transformers.generation.streamers.BaseStreamer` via `put()` and calls `end()` when the talker finishes. The standard `streamer` argument is not used because it only carries the first codebook.
+- `Qwen3TTSTokenizer.decode_chunk(codes, context_size)` decodes `(context_size + new_frames, num_quantizers)` codes and returns the waveform of the new frames only.
+- `qwen_tts.inference.codec_stream.iter_codec_rows` / `decode_in_chunks` implement the worker thread and the chunk/context bookkeeping used by `generate_voice_clone_stream`.
+
+Tests: `python -m pytest -q tests` runs on CPU with tiny randomly initialised models. `tests/manual/run_cancel_check.py` and `tests/manual/run_stream_check.py` exercise the real model on a GPU and print timings and the chunked-vs-full decode SNR.
 
 ### Launch Local Web UI Demo
 

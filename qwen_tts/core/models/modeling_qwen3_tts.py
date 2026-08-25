@@ -27,7 +27,8 @@ from torch import nn
 from torch.nn import functional as F
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
-from transformers.generation import GenerationMixin
+from transformers.generation import GenerationMixin, StoppingCriteria, StoppingCriteriaList
+from transformers.generation.streamers import BaseStreamer
 from transformers.integrations import use_kernel_forward_from_hub
 from transformers.masking_utils import (create_causal_mask,
                                         create_sliding_window_causal_mask)
@@ -1653,6 +1654,7 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         subtalker_top_p=None,
         subtalker_top_k=None,
         subtalker_temperature=None,
+        codec_streamer=None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         r"""
@@ -1679,6 +1681,8 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
                 return_dict_in_generate=True,
             )
             codec_ids = torch.cat((input_ids, predictor_result.sequences), dim=-1)
+            if codec_streamer is not None:
+                codec_streamer.put(codec_ids)
             codec_hiddens = torch.cat(
                 [last_id_hidden]
                 + [self.code_predictor.get_input_embeddings()[i](predictor_result.sequences[..., i:i+1]) for i in range(self.config.num_code_groups - 1)],
@@ -1808,6 +1812,25 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         model_kwargs["trailing_text_hidden"] = outputs.trailing_text_hidden
         model_kwargs["tts_pad_embed"] = outputs.tts_pad_embed
         return model_kwargs
+
+
+class _DeferredStoppingCriteria(StoppingCriteria):
+    """Delegate to the caller's stopping criteria only once `min_new_tokens` tokens exist.
+
+    The talker records the codec ids of token k in the forward pass of step k+1, so
+    stopping right after the first sampled token would leave `generate()` with no codec
+    rows to stack. Deferring the caller's criteria until `min_new_tokens` (>= 2) tokens
+    guarantees at least one codec row.
+    """
+
+    def __init__(self, criteria: StoppingCriteriaList, min_new_tokens: int):
+        self.criteria = criteria
+        self.min_new_tokens = min_new_tokens
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> torch.BoolTensor:
+        if input_ids.shape[1] < self.min_new_tokens:
+            return torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+        return self.criteria(input_ids, scores, **kwargs)
 
 
 class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin):
@@ -2039,6 +2062,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         subtalker_temperature: float = 0.9,
         eos_token_id: Optional[int] = None,
         repetition_penalty: float = 1.05,
+        stopping_criteria: Optional[StoppingCriteriaList] = None,
+        codec_streamer: Optional[BaseStreamer] = None,
         **kwargs,
     ):
         talker_kwargs = {
@@ -2064,6 +2089,19 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             "output_hidden_states": getattr(kwargs, "output_hidden_states", True),
             "return_dict_in_generate": getattr(kwargs, "return_dict_in_generate", True)
         }
+        # Forward caller-supplied stopping criteria to the talker so token generation
+        # can be stopped cooperatively (e.g. cancellation). Only added when given so the
+        # talker call stays unchanged otherwise. Deferred until `min_new_tokens` so that
+        # at least one codec row exists when generation stops (see _DeferredStoppingCriteria).
+        if stopping_criteria is not None:
+            talker_kwargs["stopping_criteria"] = StoppingCriteriaList([
+                _DeferredStoppingCriteria(stopping_criteria, talker_kwargs["min_new_tokens"])
+            ])
+        # Forward the codec streamer so every finished codec row (all codebooks of one
+        # frame) is pushed to the caller as soon as the talker produces it. `end()` is
+        # called once the talker finishes, mirroring Hugging Face `streamer` semantics.
+        if codec_streamer is not None:
+            talker_kwargs["codec_streamer"] = codec_streamer
         
         talker_input_embeds = [[] for _ in range(len(input_ids))]
 
@@ -2276,6 +2314,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             tts_pad_embed=tts_pad_embed,
             **talker_kwargs,
         )
+        if codec_streamer is not None:
+            codec_streamer.end()
 
         talker_codes = torch.stack([hid[-1] for hid in talker_result.hidden_states if hid[-1] is not None], dim=1)
         talker_hidden_states = torch.cat([hid[0][-1][:, -1:] for hid in talker_result.hidden_states], dim=1)[:, :-1]

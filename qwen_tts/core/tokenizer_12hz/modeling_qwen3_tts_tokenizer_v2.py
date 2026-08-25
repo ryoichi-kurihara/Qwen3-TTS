@@ -883,6 +883,12 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             wav = block(wav)
         return wav.clamp(min=-1, max=1)
 
+    def decode_chunk(self, codes, context_size):
+        """Decode `codes` of shape (batch, num_quantizers, context_size + new_frames) and return
+        the waveform of the new frames only. The leading `context_size` frames serve as left
+        context for the causal decoder; their audio is dropped."""
+        return self(codes)[..., context_size * self.total_upsample :]
+
     def chunked_decode(self, codes, chunk_size=300, left_context_size=25):
         wavs = []
         start_index = 0
@@ -890,8 +896,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             end_index = min(start_index + chunk_size, codes.shape[-1])
             context_size = left_context_size if start_index - left_context_size > 0 else start_index
             codes_chunk = codes[..., start_index - context_size : end_index]
-            wav_chunk = self(codes_chunk)
-            wavs.append(wav_chunk[..., context_size * self.total_upsample :])
+            wavs.append(self.decode_chunk(codes_chunk, context_size))
             start_index = end_index
         return torch.cat(wavs, dim=-1)
 
@@ -1022,6 +1027,21 @@ class Qwen3TTSTokenizerV2Model(Qwen3TTSTokenizerV2PreTrainedModel):
             )
 
         return Qwen3TTSTokenizerV2DecoderOutput(audio_values)
+
+    def decode_chunk(self, audio_codes: torch.Tensor, context_size: int) -> torch.Tensor:
+        """
+        Decodes one chunk of frames for streaming playback.
+
+        Args:
+            audio_codes (`torch.LongTensor` of shape `(batch_size, context_size + new_frames, num_quantizers)`):
+                Codes without padding. The leading `context_size` frames are left context only.
+            context_size (`int`):
+                Number of leading frames whose audio is not returned.
+
+        Returns:
+            `torch.Tensor` of shape `(batch_size, new_frames * decode_upsample_rate)`: waveform of the new frames.
+        """
+        return self.decoder.decode_chunk(audio_codes.transpose(1, 2), context_size).squeeze(1)
 
 
 __all__ = ["Qwen3TTSTokenizerV2Model", "Qwen3TTSTokenizerV2PreTrainedModel"]
